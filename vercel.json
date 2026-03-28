@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/rewrite.ts": {
+      "maxDuration": 60
+    },
+    "api/*.ts": {
+      "maxDuration": 30
+    }
+  }
+}
