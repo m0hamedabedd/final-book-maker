@@ -3,7 +3,7 @@ import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import {
   extractPlaylistId,
-  getPlaylistVideoIds,
+  getPlaylistVideos,
   getVideoMetadata,
   getTranscript,
   rewriteAsBookChapter,
@@ -12,7 +12,6 @@ import {
   runInBatches,
   GEMINI_BATCH_SIZE,
   TRANSCRIPT_BATCH_SIZE,
-  TITLE_BATCH_SIZE,
   BETWEEN_SUPADATA_BATCH_MS,
   BETWEEN_GEMINI_BATCH_MS,
   type TranscriptResult,
@@ -72,6 +71,7 @@ export default function App() {
   const cancelRef = useRef(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startTimeRef = useRef<number>(0);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -85,9 +85,9 @@ export default function App() {
   // Timer
   const startTimer = useCallback(() => {
     setElapsedMs(0);
-    const start = Date.now();
+    startTimeRef.current = Date.now();
     timerRef.current = setInterval(() => {
-      setElapsedMs(Date.now() - start);
+      setElapsedMs(Date.now() - startTimeRef.current);
     }, 500);
   }, []);
 
@@ -98,15 +98,12 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    return () => stopTimer();
-  }, [stopTimer]);
+  useEffect(() => () => stopTimer(), [stopTimer]);
 
   const formatTime = (ms: number) => {
     const s = Math.floor(ms / 1000);
     const m = Math.floor(s / 60);
-    const sec = s % 60;
-    return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+    return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
   };
 
   const handleStart = async () => {
@@ -121,44 +118,59 @@ export default function App() {
     startTimer();
 
     try {
-      // ─── Stage 1: Fetch video IDs ───
+      // ─── Stage 1: Fetch video IDs + titles in one call ───
       setStage("fetching-videos");
       const playlistId = extractPlaylistId(playlistUrl);
-      const videoIds = await getPlaylistVideoIds(playlistId, addLog);
 
-      if (videoIds.length === 0) throw new Error("No videos found in playlist");
+      // getPlaylistVideos returns both ids and infos (with titles) from pytubefix
+      const { infos: rawInfos } = await getPlaylistVideos(playlistId, addLog);
+
+      if (rawInfos.length === 0) throw new Error("No videos found in playlist");
       if (cancelRef.current) return cleanup();
 
-      // Get video titles in batches with delay between batches
-      addLog(`Fetching ${videoIds.length} video titles (${TITLE_BATCH_SIZE} at a time)...`);
-      const videoInfos = await runInBatches(
-        videoIds,
-        TITLE_BATCH_SIZE,
-        async (vid) => {
-          const meta = await getVideoMetadata(vid, addLog);
-          addLog(`  📹 ${meta.title}`);
-          return { id: vid, title: meta.title };
-        },
-        BETWEEN_SUPADATA_BATCH_MS,
-        undefined,
-        addLog
-      );
+      // If pytubefix didn't return titles, fall back to individual /api/video calls
+      let videoInfos = rawInfos;
+      const missingTitles = rawInfos.filter((v) => !v.title || v.title.startsWith("Video "));
+      if (missingTitles.length > 0) {
+        addLog(`Fetching ${missingTitles.length} missing video titles...`);
+        const updated = await runInBatches(
+          rawInfos,
+          3,
+          async (v) => {
+            if (!v.title || v.title.startsWith("Video ")) {
+              const meta = await getVideoMetadata(v.id, addLog);
+              addLog(`  📹 ${meta.title}`);
+              return { ...v, title: meta.title };
+            }
+            addLog(`  📹 ${v.title}`);
+            return v;
+          },
+          BETWEEN_SUPADATA_BATCH_MS,
+          undefined,
+          addLog
+        );
+        videoInfos = updated;
+      } else {
+        rawInfos.forEach((v) => addLog(`  📹 ${v.title}`));
+      }
 
       if (cancelRef.current) return cleanup();
 
-      // Sort videos by the leading number in the title (01, 02, ..., 09)
+      // Sort by leading number in title (01, 02 …)
       videoInfos.sort((a, b) => {
-        const numA = parseInt(a.title.match(/^(\d+)/)?.[1] || "0", 10);
-        const numB = parseInt(b.title.match(/^(\d+)/)?.[1] || "0", 10);
+        const numA = parseInt(a.title.match(/^(\d+)/)?.[1] ?? "0", 10);
+        const numB = parseInt(b.title.match(/^(\d+)/)?.[1] ?? "0", 10);
         if (numA !== 0 && numB !== 0) return numA - numB;
         return 0;
       });
       addLog(`📋 Videos sorted by chapter order`);
 
-      // ─── Stage 2: Get transcripts in batches with retry & delay ───
+      // ─── Stage 2: Transcripts ───
       setStage("fetching-transcripts");
       setProgress({ current: 0, total: videoInfos.length });
-      addLog(`\nFetching transcripts (${TRANSCRIPT_BATCH_SIZE} at a time, ${BETWEEN_SUPADATA_BATCH_MS / 1000}s between batches)...`);
+      addLog(
+        `\nFetching transcripts (${TRANSCRIPT_BATCH_SIZE} at a time)...`
+      );
 
       let detectedArabic = false;
       const allTranscripts: TranscriptResult[] = [];
@@ -181,8 +193,8 @@ export default function App() {
               content: result.content,
               lang: result.lang,
             } as TranscriptResult;
-          } catch (err: any) {
-            addLog(`  ⚠️ Skipping ${info.title}: ${err.message}`);
+          } catch (err: unknown) {
+            addLog(`  ⚠️ Skipping ${info.title}: ${(err as Error).message}`);
             return null;
           }
         },
@@ -211,47 +223,33 @@ export default function App() {
 
       const finalChapters: ChapterResult[] = [];
 
-      // Process in Gemini batches
-      for (let batchStart = 0; batchStart < allTranscripts.length; batchStart += GEMINI_BATCH_SIZE) {
+      for (
+        let batchStart = 0;
+        batchStart < allTranscripts.length;
+        batchStart += GEMINI_BATCH_SIZE
+      ) {
         if (cancelRef.current) return cleanup();
 
         const batchEnd = Math.min(batchStart + GEMINI_BATCH_SIZE, allTranscripts.length);
         const batch = allTranscripts.slice(batchStart, batchEnd);
 
-        addLog(`\n── Gemini Batch ${Math.floor(batchStart / GEMINI_BATCH_SIZE) + 1}: chapters ${batchStart + 1}–${batchEnd} ──`);
+        addLog(
+          `\n── Gemini Batch ${Math.floor(batchStart / GEMINI_BATCH_SIZE) + 1}: chapters ${batchStart + 1}–${batchEnd} ──`
+        );
 
         const batchResults = await Promise.all(
           batch.map(async (t, j) => {
             const idx = batchStart + j;
             try {
-              // Step A: Gemini rewrite → markdown
-              const markdown = await rewriteAsBookChapter(
-                t.content,
-                idx,
-                t.title,
-                addLog
-              );
-
-              // Step B: Convert markdown → LaTeX locally (instant!)
+              const markdown = await rewriteAsBookChapter(t.content, idx, t.title, addLog);
               const latex = markdownToLatex(markdown, t.title);
-              addLog(`  📄 Chapter ${idx + 1} LaTeX converted locally (${latex.length} chars)`);
-
-              return {
-                index: idx,
-                title: t.title,
-                markdownContent: markdown,
-                latexContent: latex,
-              } as ChapterResult;
-            } catch (err: any) {
-              addLog(`  ❌ Chapter ${idx + 1} failed: ${err.message}`);
-              // Fallback: use raw transcript
-              const fallbackLatex = `\\chapter{${t.title}}\n\n% Error processing this chapter: ${err.message}\n% Using raw transcript as fallback\n\n${t.content.replace(/[%&$#_{}~^]/g, "\\$&")}`;
-              return {
-                index: idx,
-                title: t.title,
-                markdownContent: t.content,
-                latexContent: fallbackLatex,
-              } as ChapterResult;
+              addLog(`  📄 Chapter ${idx + 1} LaTeX converted (${latex.length} chars)`);
+              return { index: idx, title: t.title, markdownContent: markdown, latexContent: latex } as ChapterResult;
+            } catch (err: unknown) {
+              const msg = (err as Error).message;
+              addLog(`  ❌ Chapter ${idx + 1} failed: ${msg}`);
+              const fallbackLatex = `\\chapter{${t.title}}\n\n% Error: ${msg}\n\n${t.content.replace(/[%&$#_{}~^]/g, "\\$&")}`;
+              return { index: idx, title: t.title, markdownContent: t.content, latexContent: fallbackLatex } as ChapterResult;
             }
           })
         );
@@ -259,18 +257,16 @@ export default function App() {
         finalChapters.push(...batchResults);
         setProgress({ current: finalChapters.length, total: allTranscripts.length });
 
-        // Brief delay between Gemini batches (only if more remain)
         if (batchEnd < allTranscripts.length) {
           addLog(`  ⏳ Brief pause before next batch...`);
           await delay(BETWEEN_GEMINI_BATCH_MS);
         }
       }
 
-      // Sort by index to ensure correct order
       finalChapters.sort((a, b) => a.index - b.index);
       setChapters(finalChapters);
 
-      // ─── Stage 4: Generate book package ───
+      // ─── Stage 4: Generate ZIP ───
       setStage("generating-book");
       addLog("\n═══ Generating book package ═══");
 
@@ -282,7 +278,6 @@ export default function App() {
         chapterCount: finalChapters.length,
       });
 
-      // Create ZIP
       const zip = new JSZip();
       const bookFolder = zip.folder("book")!;
       bookFolder.file("main.tex", mainTex);
@@ -292,13 +287,11 @@ export default function App() {
         chaptersFolder.file(`chapter${i + 1}.tex`, ch.latexContent);
       });
 
-      // Also add markdown files for reference
       const mdFolder = bookFolder.folder("markdown_chapters")!;
       finalChapters.forEach((ch, i) => {
         mdFolder.file(`chapter${i + 1}.md`, ch.markdownContent);
       });
 
-      // Also add raw transcripts
       const transcriptsFolder = bookFolder.folder("raw_transcripts")!;
       allTranscripts.forEach((t, i) => {
         transcriptsFolder.file(
@@ -312,16 +305,17 @@ export default function App() {
       setZipBlob(blob);
 
       stopTimer();
-      addLog(`\n✅ Book package ready! Total time: ${formatTime(Date.now() - (Date.now() - elapsedMs))}`);
+      addLog(`\n✅ Book package ready! Total time: ${formatTime(Date.now() - startTimeRef.current)}`);
       setStage("done");
-    } catch (err: any) {
+    } catch (err: unknown) {
       stopTimer();
       if (cancelRef.current) {
         addLog("⛔ Process cancelled");
         setStage("idle");
       } else {
-        setErrorMsg(err.message || "Unknown error");
-        addLog(`❌ Error: ${err.message}`);
+        const msg = (err as Error).message || "Unknown error";
+        setErrorMsg(msg);
+        addLog(`❌ Error: ${msg}`);
         setStage("error");
       }
     }
@@ -360,11 +354,9 @@ export default function App() {
             📖
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight">
-              Playlist → Book
-            </h1>
+            <h1 className="text-lg font-bold tracking-tight">Playlist → Book</h1>
             <p className="text-xs text-slate-400">
-              YouTube playlist to LaTeX book — optimized for speed ⚡
+              YouTube playlist to LaTeX book — no API keys needed ⚡
             </p>
           </div>
           {isRunning && (
@@ -391,92 +383,53 @@ export default function App() {
                 Configuration
               </h2>
               <div className="space-y-4">
+                {[
+                  { label: "YouTube Playlist URL *", value: playlistUrl, set: setPlaylistUrl, placeholder: "https://youtube.com/playlist?list=PLxxxxx" },
+                  { label: "Book Title *", value: bookTitle, set: setBookTitle, placeholder: "My Book Title" },
+                  { label: "Subtitle", value: bookSubtitle, set: setBookSubtitle, placeholder: "An optional subtitle" },
+                  { label: "Author Name *", value: authorName, set: setAuthorName, placeholder: "Author Name" },
+                ].map(({ label, value, set, placeholder }) => (
+                  <div key={label}>
+                    <label className="mb-1 block text-xs font-medium text-slate-400">{label}</label>
+                    <input
+                      type="text"
+                      value={value}
+                      onChange={(e) => set(e.target.value)}
+                      placeholder={placeholder}
+                      disabled={isRunning}
+                      className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
+                    />
+                  </div>
+                ))}
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-400">
-                    YouTube Playlist URL *
-                  </label>
-                  <input
-                    type="text"
-                    value={playlistUrl}
-                    onChange={(e) => setPlaylistUrl(e.target.value)}
-                    placeholder="https://youtube.com/playlist?list=PLxxxxx"
-                    disabled={isRunning}
-                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-400">
-                    Book Title *
-                  </label>
-                  <input
-                    type="text"
-                    value={bookTitle}
-                    onChange={(e) => setBookTitle(e.target.value)}
-                    placeholder="My Book Title"
-                    disabled={isRunning}
-                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-400">
-                    Subtitle
-                  </label>
-                  <input
-                    type="text"
-                    value={bookSubtitle}
-                    onChange={(e) => setBookSubtitle(e.target.value)}
-                    placeholder="An optional subtitle"
-                    disabled={isRunning}
-                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-400">
-                    Author Name *
-                  </label>
-                  <input
-                    type="text"
-                    value={authorName}
-                    onChange={(e) => setAuthorName(e.target.value)}
-                    placeholder="Author Name"
-                    disabled={isRunning}
-                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-400">
-                    Language
-                  </label>
+                  <label className="mb-1 block text-xs font-medium text-slate-400">Language</label>
                   <select
                     value={language}
-                    onChange={(e) =>
-                      setLanguage(e.target.value as "en" | "ar")
-                    }
+                    onChange={(e) => setLanguage(e.target.value as "en" | "ar")}
                     disabled={isRunning}
                     className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-100 transition focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
                   >
                     <option value="en">English</option>
                     <option value="ar">Arabic (عربي)</option>
                   </select>
-                  <p className="mt-1 text-xs text-slate-500">
-                    Auto-detected from first transcript if available
-                  </p>
+                  <p className="mt-1 text-xs text-slate-500">Auto-detected from transcripts</p>
                 </div>
               </div>
             </div>
 
-            {/* Speed optimization info */}
+            {/* Info box */}
             <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
               <p className="mb-2 text-xs font-semibold text-emerald-400">⚡ How it works</p>
               <ul className="space-y-1 text-xs text-emerald-300/70">
-                <li>• Transcripts: {TRANSCRIPT_BATCH_SIZE} parallel + auto-retry on 429</li>
+                <li>• Playlist & titles fetched via <strong>pytubefix</strong> (no API key)</li>
+                <li>• Transcripts fetched via <strong>youtube-transcript-api</strong></li>
+                <li>• {TRANSCRIPT_BATCH_SIZE} transcripts in parallel with auto-retry</li>
                 <li>• Gemini: {GEMINI_BATCH_SIZE} chapters rewritten simultaneously</li>
-                <li>• Long transcripts auto-split into chunks — <b>zero summarization</b></li>
-                <li>• LaTeX: converted locally (instant, no API call)</li>
-                <li>• Input/output size tracking to detect any content loss</li>
+                <li>• Long transcripts auto-split — zero summarization</li>
+                <li>• LaTeX converted locally (instant)</li>
               </ul>
               <p className="mt-2 text-xs text-slate-500">
-                Est. ~3–8 min for 8-9 chapters (depending on transcript length)
+                Est. ~3–8 min for 8–9 chapters
               </p>
             </div>
 
@@ -508,10 +461,7 @@ export default function App() {
                     📦 Download Book ZIP
                   </button>
                   <button
-                    onClick={() => {
-                      setStage("idle");
-                      setLogs([]);
-                    }}
+                    onClick={() => { setStage("idle"); setLogs([]); }}
                     className="rounded-xl border border-slate-700 bg-slate-800 px-5 py-3 text-sm font-semibold text-slate-300 transition hover:bg-slate-700"
                   >
                     🔄
@@ -520,10 +470,7 @@ export default function App() {
               )}
               {stage === "error" && (
                 <button
-                  onClick={() => {
-                    setStage("idle");
-                    setErrorMsg("");
-                  }}
+                  onClick={() => { setStage("idle"); setErrorMsg(""); }}
                   className="flex-1 rounded-xl border border-slate-700 bg-slate-800 px-5 py-3 text-sm font-semibold text-slate-300 transition hover:bg-slate-700"
                 >
                   🔄 Try Again
@@ -531,7 +478,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Progress Steps */}
+            {/* Pipeline Steps */}
             {stage !== "idle" && (
               <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-6 shadow-xl">
                 <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-slate-400">
@@ -546,24 +493,19 @@ export default function App() {
                       <div key={s} className="flex items-center gap-3">
                         <div
                           className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold transition-all ${
-                            isCompleted
-                              ? "bg-emerald-500 text-white"
-                              : isActive
-                                ? "animate-pulse bg-violet-500 text-white"
-                                : isFuture
-                                  ? "border border-slate-700 bg-slate-800 text-slate-500"
-                                  : "bg-slate-800 text-slate-500"
+                            isCompleted ? "bg-emerald-500 text-white"
+                            : isActive ? "animate-pulse bg-violet-500 text-white"
+                            : isFuture ? "border border-slate-700 bg-slate-800 text-slate-500"
+                            : "bg-slate-800 text-slate-500"
                           }`}
                         >
                           {isCompleted ? "✓" : i + 1}
                         </div>
                         <span
                           className={`text-sm ${
-                            isActive
-                              ? "font-medium text-violet-300"
-                              : isCompleted
-                                ? "text-emerald-400"
-                                : "text-slate-500"
+                            isActive ? "font-medium text-violet-300"
+                            : isCompleted ? "text-emerald-400"
+                            : "text-slate-500"
                           }`}
                         >
                           {STAGE_LABELS[s]}
@@ -573,26 +515,16 @@ export default function App() {
                   })}
                 </div>
 
-                {/* Sub-progress bar */}
                 {progress.total > 0 && isRunning && (
                   <div className="mt-4">
                     <div className="mb-1 flex justify-between text-xs text-slate-400">
-                      <span>
-                        {progress.current} / {progress.total}
-                      </span>
-                      <span>
-                        {Math.round(
-                          (progress.current / progress.total) * 100
-                        )}
-                        %
-                      </span>
+                      <span>{progress.current} / {progress.total}</span>
+                      <span>{Math.round((progress.current / progress.total) * 100)}%</span>
                     </div>
                     <div className="h-2 overflow-hidden rounded-full bg-slate-800">
                       <div
                         className="h-full rounded-full bg-gradient-to-r from-violet-500 to-indigo-500 transition-all duration-500"
-                        style={{
-                          width: `${(progress.current / progress.total) * 100}%`,
-                        }}
+                        style={{ width: `${(progress.current / progress.total) * 100}%` }}
                       />
                     </div>
                   </div>
@@ -607,39 +539,21 @@ export default function App() {
                   📗 Book Generated
                 </h2>
                 <div className="space-y-2 text-sm text-slate-300">
-                  <p>
-                    <span className="text-slate-400">Title:</span>{" "}
-                    {bookTitle || "Untitled"}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Author:</span>{" "}
-                    {authorName || "Unknown"}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Chapters:</span>{" "}
-                    {chapters.length}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Transcripts:</span>{" "}
-                    {transcripts.length}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Language:</span>{" "}
-                    {language === "ar" ? "Arabic" : "English"}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Compiler:</span>{" "}
-                    {language === "ar" ? "XeLaTeX" : "pdfLaTeX"}
-                  </p>
-                  <p>
-                    <span className="text-slate-400">Time:</span>{" "}
-                    {formatTime(elapsedMs)}
-                  </p>
+                  {[
+                    ["Title", bookTitle || "Untitled"],
+                    ["Author", authorName || "Unknown"],
+                    ["Chapters", String(chapters.length)],
+                    ["Transcripts", String(transcripts.length)],
+                    ["Language", language === "ar" ? "Arabic" : "English"],
+                    ["Compiler", language === "ar" ? "XeLaTeX" : "pdfLaTeX"],
+                    ["Time", formatTime(elapsedMs)],
+                  ].map(([k, v]) => (
+                    <p key={k}><span className="text-slate-400">{k}:</span> {v}</p>
+                  ))}
                 </div>
                 <div className="mt-4 border-t border-slate-700/50 pt-3">
                   <p className="text-xs text-slate-500">
-                    ZIP contains: main.tex, chapters/ (LaTeX),
-                    markdown_chapters/, raw_transcripts/
+                    ZIP contains: main.tex, chapters/ (LaTeX), markdown_chapters/, raw_transcripts/
                   </p>
                 </div>
               </div>
@@ -660,7 +574,7 @@ export default function App() {
                   </div>
                 )}
                 {errorMsg && (
-                  <span className="text-xs text-red-400 truncate max-w-[200px]">{errorMsg}</span>
+                  <span className="max-w-[200px] truncate text-xs text-red-400">{errorMsg}</span>
                 )}
               </div>
               <div className="h-[calc(100vh-12rem)] overflow-y-auto p-4 font-mono text-xs leading-relaxed">
@@ -668,9 +582,7 @@ export default function App() {
                   <div className="flex h-full items-center justify-center text-slate-600">
                     <div className="text-center">
                       <p className="text-3xl">📋</p>
-                      <p className="mt-2">
-                        Logs will appear here once processing starts
-                      </p>
+                      <p className="mt-2">Logs will appear here once processing starts</p>
                     </div>
                   </div>
                 ) : (
@@ -678,21 +590,15 @@ export default function App() {
                     {logs.map((log, i) => (
                       <div
                         key={i}
-                        className={`${
-                          log.includes("❌")
-                            ? "text-red-400"
-                            : log.includes("✅")
-                              ? "text-emerald-400"
-                              : log.includes("⚠️")
-                                ? "text-amber-400"
-                                : log.includes("═══")
-                                  ? "font-bold text-violet-300"
-                                  : log.includes("──")
-                                    ? "text-indigo-300"
-                                    : log.includes("⏳")
-                                      ? "text-amber-300/60"
-                                      : "text-slate-400"
-                        }`}
+                        className={
+                          log.includes("❌") ? "text-red-400"
+                          : log.includes("✅") ? "text-emerald-400"
+                          : log.includes("⚠️") ? "text-amber-400"
+                          : log.includes("═══") ? "font-bold text-violet-300"
+                          : log.includes("──") ? "text-indigo-300"
+                          : log.includes("⏳") ? "text-amber-300/60"
+                          : "text-slate-400"
+                        }
                       >
                         {log}
                       </div>
@@ -705,7 +611,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Chapter Preview (when done) */}
+        {/* Chapter Overview */}
         {stage === "done" && chapters.length > 0 && (
           <div className="mt-8">
             <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-slate-400">
@@ -721,13 +627,9 @@ export default function App() {
                     <span className="flex h-6 w-6 items-center justify-center rounded-md bg-violet-500/20 text-xs font-bold text-violet-400">
                       {ch.index + 1}
                     </span>
-                    <span className="text-xs text-slate-500">
-                      chapter{ch.index + 1}.tex
-                    </span>
+                    <span className="text-xs text-slate-500">chapter{ch.index + 1}.tex</span>
                   </div>
-                  <h3 className="text-sm font-medium text-slate-200 line-clamp-2">
-                    {ch.title}
-                  </h3>
+                  <h3 className="line-clamp-2 text-sm font-medium text-slate-200">{ch.title}</h3>
                   <div className="mt-2 flex gap-3 text-xs text-slate-500">
                     <span>📝 {ch.markdownContent.length.toLocaleString()} md</span>
                     <span>📄 {ch.latexContent.length.toLocaleString()} tex</span>
@@ -739,9 +641,8 @@ export default function App() {
         )}
       </main>
 
-      {/* Footer */}
       <footer className="mt-12 border-t border-slate-800/50 py-6 text-center text-xs text-slate-600">
-        Playlist → Book | YouTube to LaTeX Book Generator | ⚡ Optimized
+        Playlist → Book | YouTube to LaTeX Book Generator | ⚡ Powered by youtube-transcript-api + pytubefix
       </footer>
     </div>
   );

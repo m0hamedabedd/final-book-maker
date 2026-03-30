@@ -1,0 +1,2 @@
+youtube-transcript-api>=0.6.3
+pytubefix>=8.0.0

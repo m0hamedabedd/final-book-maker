@@ -5,7 +5,16 @@
     "api/rewrite.ts": {
       "maxDuration": 60
     },
-    "api/*.ts": {
+    "api/playlist.py": {
+      "runtime": "python3.12",
+      "maxDuration": 30
+    },
+    "api/video.py": {
+      "runtime": "python3.12",
+      "maxDuration": 15
+    },
+    "api/transcript.py": {
+      "runtime": "python3.12",
       "maxDuration": 30
     }
   }
