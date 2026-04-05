@@ -6,23 +6,5 @@
       "source": "/(.*)",
       "destination": "/index.html"
     }
-  ],
-  "functions": {
-    "api/rewrite.ts": {
-      "maxDuration": 60,
-      "excludeFiles": ["node_modules/**"]
-    },
-    "api/playlist.py": {
-      "maxDuration": 30,
-      "excludeFiles": ["node_modules/**"]
-    },
-    "api/video.py": {
-      "maxDuration": 15,
-      "excludeFiles": ["node_modules/**"]
-    },
-    "api/transcript.py": {
-      "maxDuration": 30,
-      "excludeFiles": ["node_modules/**"]
-    }
-  }
+  ]
 }
