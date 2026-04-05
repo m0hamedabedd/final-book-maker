@@ -9,16 +9,20 @@
   ],
   "functions": {
     "api/rewrite.ts": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "excludeFiles": ["node_modules/**"]
     },
     "api/playlist.py": {
-      "maxDuration": 30
+      "maxDuration": 30,
+      "excludeFiles": ["node_modules/**"]
     },
     "api/video.py": {
-      "maxDuration": 15
+      "maxDuration": 15,
+      "excludeFiles": ["node_modules/**"]
     },
     "api/transcript.py": {
-      "maxDuration": 30
+      "maxDuration": 30,
+      "excludeFiles": ["node_modules/**"]
     }
   }
 }
