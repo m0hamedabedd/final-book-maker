@@ -331,30 +331,41 @@ async function processChunk(
     }
   }
 
-  const prompt = `**Act as an expert book editor.** I will provide you with a raw transcript from a video titled "${chapterTitle}". Your task is to format and refine this transcript into a highly readable book chapter.
+  const prompt = `Act as an expert book editor. I will provide you with a raw transcript from a video titled "${chapterTitle}". Your task is to transform this transcript into a polished, highly readable book chapter while strictly preserving the speaker's original tone and dialect.
 
-You must strictly follow these rules:
+Follow these rules carefully:
 
-**1. STRICT DIALECT & LANGUAGE RULE:**
-Preserve the exact original spoken dialect. If the speaker uses Egyptian Arabic (العامية المصرية), keep it in Egyptian Arabic. **DO NOT** translate into Modern Standard Arabic (الفصحى).
+1. **STRICT DIALECT & LANGUAGE PRESERVATION**
+   - Keep the exact original spoken dialect (e.g., Egyptian Arabic, العامية المصرية). 
+   - Do NOT translate into Modern Standard Arabic (الفصحى) or any other dialect.
 
-**2. ZERO SUMMARIZATION — MOST IMPORTANT RULE:**
-Do not summarize, cut, or skip ANY stories, examples, or sentences. Every piece of information must be included. Output should be roughly the same length as the input or longer — NEVER shorter.
+2. **NO SUMMARIZATION OR CUTTING CONTENT**
+   - Include every story, example, and sentence.
+   - The output should be roughly the same length or longer than the original text. NEVER shorten it.
 
-**3. CLEANUP, BUT NO REWRITING:**
-Remove spoken noise (stuttering, repeated words, filler words like "um", "uh", "يعني"). Do not rewrite sentences to sound formal or AI-generated. Keep the natural, human tone.
+3. **CLEANUP WITHOUT REWRITING**
+   - Remove fillers, stutters, repeated words, and spoken noises (e.g., "um", "uh", "يعني").
+   - Do not rewrite or formalize sentences. Keep the natural human tone intact.
 
-**4. READABILITY & FORMATTING:**
-- Break into logical paragraphs.
-- Add proper punctuation.
-- If the speaker changes topics, add a bold **Section Title**.
-- Use Markdown (# for chapter title, ## for sections, **bold**, *italic*)
+4. **IMPROVE READABILITY & STRUCTURE**
+   - Break the text into clear, logical paragraphs.
+   - Insert proper punctuation.
+   - Add **Section Titles** in bold when topics change.
+   - Use Markdown formatting (#, ##, **bold**, *italic*) where appropriate.
+   - Smooth minor abrupt transitions for readability, without changing meaning.
+
+5. **STRICTLY NO AI FILLER**
+   - Do not add introductions, conclusions, or commentary from the AI. Start formatting immediately.
+
+6. **FLEXIBLE CONNECTIVITY**
+   - Where spoken language is fragmented, connect sentences naturally for reading flow while preserving the original meaning.
+   - Maintain all nuances, humor, or emphasis the speaker conveys.
+
 ${isFirstChunk && totalChunks === 1 ? `- Start with: # ${chapterTitle}` : ""}
 
-**5. NO AI FILLER:**
-Do not add introductory or concluding AI remarks. Just start formatting immediately.${chunkContext}
+${chunkContext}
 
-**Here is the transcript:**
+Here is the transcript:
 
 ${text}`;
 
